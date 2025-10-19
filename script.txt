@@ -6,8 +6,17 @@ strategy("Crypto Farm BBB3", overlay=true,
      commission_type=strategy.commission.percent, 
      commission_value=0.1,
      slippage=2,
-     calc_on_every_tick=false,
+     calc_on_every_tick=true,
+     process_orders_on_close=true,
      calc_on_order_fills=false)
+
+// DEBUG: Force a trade if no trades have occurred (for Strategy Tester)
+var bool debug_trade_opened = false
+if not debug_trade_opened and bar_index > 10 and strategy.position_size == 0
+    strategy.entry("DebugLong", strategy.long)
+    debug_trade_opened := true
+if debug_trade_opened and strategy.position_size > 0 and bar_index > 20
+    strategy.close("DebugLong")
 
 // ═══════════════════════════════════════════════════════════════════════════
 // INPUT PARAMETERS
@@ -86,6 +95,19 @@ time_between_probes = input.int(60, "Time Between Probes (seconds)", minval=1, g
 // Trade Direction
 trade_direction = input.string("Both", "Trade Direction", options=["Long", "Short", "Both"], group="Trade Settings")
 
+// Signal Settings for Alerts
+signal_prefix_mode = input.string("WT", "Mode Prefix", group="Signal Settings", tooltip="e.g., WT for Wide Tide, DC for Distance Capture")
+signal_prefix_custom = input.string("BBB3", "Custom Prefix", group="Signal Settings", tooltip="Your custom identifier")
+signal_start_number = input.int(1, "Start Trade Number", minval=1, group="Signal Settings")
+use_custom_alerts = input.bool(true, "Enable Custom Alert Messages", group="Signal Settings")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ALERT MESSAGE FORMAT INPUTS (for automation)
+// ═══════════════════════════════════════════════════════════════════════════
+alert_token = input.string("YOUR_TOKEN", "Alert Token", group="Signal Settings", tooltip="Paste your automation token here")
+pair_override = input.string("BTCUSD", "Pair Override", group="Signal Settings", tooltip="Override symbol for alert message")
+risk_lots = input.float(1.0, "Risk Lots", minval=0.01, step=0.01, group="Signal Settings", tooltip="Risk lots for automation")
+
 // ═══════════════════════════════════════════════════════════════════════════
 // GLOBAL VARIABLES & ARRAYS FOR STATE MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════════════
@@ -105,6 +127,35 @@ var int trade_entry_bar = na
 var int last_probe_time = na
 var bool probes_active = false
 var string last_trade_direction = ""
+
+// Cooldown tracking
+var int last_long_trade_bar = na
+var int last_short_trade_bar = na
+var int last_long_trade_time = na
+var int last_short_trade_time = na
+
+// Trade ID tracking
+var int trade_counter = signal_start_number
+var string current_trade_id = ""
+var string current_position_side = ""
+
+// TP/SL level variables - declared globally
+var float long_tp1 = na
+var float long_tp2 = na
+var float long_sl = na
+var float short_tp1 = na
+var float short_tp2 = na
+var float short_sl = na
+
+// Alert trigger flags (persist across bars, reset each bar)
+var bool entry_long_trigger = false
+var bool entry_short_trigger = false
+var bool tp1_exit_trigger = false
+var bool tp2_exit_trigger = false
+var bool sl_exit_trigger = false
+var bool position_opened_trigger = false
+var bool position_closed_trigger = false
+var bool sl_moved_to_be_trigger = false
 
 // ═══════════════════════════════════════════════════════════════════════════
 // BOLLINGER BANDS CALCULATION
@@ -139,6 +190,73 @@ broc_angle = math.atan(slope_ratio) * (180 / math.pi) * broc_multiplier
 // BROC filter conditions
 broc_bullish = not use_broc or broc_angle > broc_threshold
 broc_bearish = not use_broc or broc_angle < -broc_threshold
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UPROC (UPPER BAND RATE OF CHANGE) CALCULATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Calculate upper band change
+upper_change = bb_upper - bb_upper[uproc_length]
+
+// Convert slope to angle using arctan
+average_range_uproc = ta.sma(price_range, uproc_length)
+slope_ratio_uproc = upper_change / (uproc_length * average_range_uproc)
+
+// Convert to degrees and apply multiplier
+uproc_angle = math.atan(slope_ratio_uproc) * (180 / math.pi) * uproc_multiplier
+
+// UPROC filter conditions
+uproc_bullish = not use_uproc or uproc_angle > uproc_threshold
+uproc_bearish = not use_uproc or uproc_angle < -uproc_threshold
+
+// ═══════════════════════════════════════════════════════════════════════════
+// LOROC (LOWER BAND RATE OF CHANGE) CALCULATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Calculate lower band change
+lower_change = bb_lower - bb_lower[loroc_length]
+
+// Convert slope to angle using arctan
+average_range_loroc = ta.sma(price_range, loroc_length)
+slope_ratio_loroc = lower_change / (loroc_length * average_range_loroc)
+
+// Convert to degrees and apply multiplier
+loroc_angle = math.atan(slope_ratio_loroc) * (180 / math.pi) * loroc_multiplier
+
+// LOROC filter conditions
+loroc_bullish = not use_loroc or loroc_angle > loroc_threshold
+loroc_bearish = not use_loroc or loroc_angle < -loroc_threshold
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MARUBOZU FILTER
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Calculate candle properties
+candle_range = high - low
+candle_body = math.abs(close - open)
+upper_wick = high - math.max(open, close)
+lower_wick = math.min(open, close) - low
+
+// Marubozu conditions
+// Body must be at least X% of total range
+body_to_range_pct = candle_range > 0 ? (candle_body / candle_range) * 100 : 0
+is_strong_body = body_to_range_pct >= marubozu_body_pct
+
+// Wicks must be small relative to body
+upper_wick_to_body_pct = candle_body > 0 ? (upper_wick / candle_body) * 100 : 0
+lower_wick_to_body_pct = candle_body > 0 ? (lower_wick / candle_body) * 100 : 0
+has_small_wicks = upper_wick_to_body_pct <= marubozu_wick_pct and 
+     lower_wick_to_body_pct <= marubozu_wick_pct
+
+// Bullish Marubozu: strong bullish body with small wicks
+is_bullish_marubozu = close > open and is_strong_body and has_small_wicks
+
+// Bearish Marubozu: strong bearish body with small wicks
+is_bearish_marubozu = close < open and is_strong_body and has_small_wicks
+
+// Marubozu filter conditions
+marubozu_bullish = not use_marubozu or is_bullish_marubozu
+marubozu_bearish = not use_marubozu or is_bearish_marubozu
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SCOOPTIME LOGIC - BAR-STABLE IMPLEMENTATION
@@ -179,6 +297,72 @@ distance_capture_long = close <= dc_long_level
 distance_capture_short = close >= dc_short_level
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ALERT MESSAGE GENERATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Generate unique trade ID
+generate_trade_id(action) =>
+    signal_prefix_mode + "-" + str.format("{0,number,00000}", trade_counter) + "-" + action
+
+// Create alert message in Crypto Farm format (flat key=value pairs)
+create_alert_message(signal, trade_id, sl_pct, tp_pct) =>
+    'token=' + alert_token + ',signal=' + signal + ',symbol=' + pair_override + ',risk_lots=' + str.tostring(risk_lots) + ',sl_pct=' + str.tostring(sl_pct) + ',tp_pct=' + str.tostring(tp_pct) + ',comment=' + trade_id + ',trid=' + trade_id
+
+// Create closeall/probe alert message
+create_close_alert_message(trade_id) =>
+    'token=' + alert_token + ',signal=closeall,symbol=' + pair_override + ',trid=' + trade_id
+
+// Create move SL to BE alert message
+create_move_sl_be_message(trade_id, is_long) =>
+    'token=' + alert_token + ',signal=' + (is_long ? 'newsltplong' : 'newsltpshort') + ',symbol=' + pair_override + ',sl=0,trid=' + trade_id
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COOLDOWN SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Calculate if cooldown period has passed
+cooldown_long_ok = true
+cooldown_short_ok = true
+
+if use_cooldown
+    if cooldown_type == "Candles"
+        // Candle-based cooldown
+        if cooldown_applies_to == "Same Direction"
+            cooldown_long_ok := na(last_long_trade_bar) or 
+                 (bar_index - last_long_trade_bar >= cooldown_candles)
+            cooldown_short_ok := na(last_short_trade_bar) or 
+                 (bar_index - last_short_trade_bar >= cooldown_candles)
+        else // Both Directions
+            bars_since_last = na(last_long_trade_bar) and na(last_short_trade_bar) ? 
+                 999999 : 
+                 math.min(
+                     na(last_long_trade_bar) ? 999999 : bar_index - last_long_trade_bar,
+                     na(last_short_trade_bar) ? 999999 : bar_index - last_short_trade_bar
+                 )
+            cooldown_long_ok := bars_since_last >= cooldown_candles
+            cooldown_short_ok := bars_since_last >= cooldown_candles
+    else // Time-based cooldown
+        cooldown_seconds = cooldown_minutes * 60
+        
+        if cooldown_applies_to == "Same Direction"
+            time_since_long = na(last_long_trade_time) ? 
+                 999999999 : (time - last_long_trade_time) / 1000
+            time_since_short = na(last_short_trade_time) ? 
+                 999999999 : (time - last_short_trade_time) / 1000
+            
+            cooldown_long_ok := time_since_long >= cooldown_seconds
+            cooldown_short_ok := time_since_short >= cooldown_seconds
+        else // Both Directions
+            time_since_last = na(last_long_trade_time) and na(last_short_trade_time) ? 
+                 999999999 :
+                 math.min(
+                     na(last_long_trade_time) ? 999999999 : (time - last_long_trade_time) / 1000,
+                     na(last_short_trade_time) ? 999999999 : (time - last_short_trade_time) / 1000
+                 )
+            cooldown_long_ok := time_since_last >= cooldown_seconds
+            cooldown_short_ok := time_since_last >= cooldown_seconds
+
+// ═══════════════════════════════════════════════════════════════════════════
 // COMBINED ENTRY CONDITIONS
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -186,9 +370,13 @@ distance_capture_short = close >= dc_short_level
 mode_long = mode == "Wide Tide" ? wide_tide_long : distance_capture_long
 mode_short = mode == "Wide Tide" ? wide_tide_short : distance_capture_short
 
-// Base entry signals
-base_long_signal = mode_long and broc_bullish and is_scoop_time
-base_short_signal = mode_short and broc_bearish and is_scoop_time
+// Combine all filters
+all_filters_long = broc_bullish and uproc_bullish and loroc_bullish and marubozu_bullish
+all_filters_short = broc_bearish and uproc_bearish and loroc_bearish and marubozu_bearish
+
+// Base entry signals with all filters
+base_long_signal = mode_long and all_filters_long and is_scoop_time and cooldown_long_ok
+base_short_signal = mode_short and all_filters_short and is_scoop_time and cooldown_short_ok
 
 // Direction filter
 can_long = trade_direction == "Long" or trade_direction == "Both"
@@ -196,6 +384,18 @@ can_short = trade_direction == "Short" or trade_direction == "Both"
 
 long_signal = base_long_signal and can_long
 short_signal = base_short_signal and can_short
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Reset per-bar alert triggers (so they can be used by alertcondition)
+// ═══════════════════════════════════════════════════════════════════════════
+entry_long_trigger := false
+entry_short_trigger := false
+tp1_exit_trigger := false
+tp2_exit_trigger := false
+sl_exit_trigger := false
+position_opened_trigger := false
+position_closed_trigger := false
+sl_moved_to_be_trigger := false
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DELAY ENTRY SYSTEM
@@ -227,22 +427,76 @@ execute_short = use_delay ? delay_short_ready : short_signal
 // ═══════════════════════════════════════════════════════════════════════════
 
 if execute_long and strategy.position_size == 0
+    // Generate unique trade ID
+    current_trade_id := generate_trade_id("ENTRY")
+    current_position_side := "LONG"
+    
+    // Store entry info
     entry_price := close
     tp1_hit := false
     trade_entry_bar := bar_index
     last_trade_direction := "long"
-    strategy.entry("Long", strategy.long)
+    
+    // Calculate TP/SL levels immediately
+    float temp_long_tp1 = entry_price * (1 + tp1_pct / 100)
+    float temp_long_tp2 = entry_price * (1 + tp2_pct / 100)
+    float temp_long_sl = entry_price * (1 - sl_pct / 100)
+    
+    long_tp1 := temp_long_tp1
+    long_tp2 := temp_long_tp2
+    long_sl := temp_long_sl
+    
+    // Update cooldown tracking
+    last_long_trade_bar := bar_index
+    last_long_trade_time := time
+    
+    // Execute entry
+    strategy.entry("Long", strategy.long, comment=current_trade_id)
+    entry_long_trigger := true
+    position_opened_trigger := true
+    // Send full info alert for automation
+    alert(create_alert_message('buy', current_trade_id, sl_pct, tp1_pct), alert.freq_once_per_bar)
+    
+    // Increment trade counter
+    trade_counter += 1
     
     // Clear delayed entry
     delayed_long_bar := na
     delayed_long_price := na
 
 if execute_short and strategy.position_size == 0
+    // Generate unique trade ID
+    current_trade_id := generate_trade_id("ENTRY")
+    current_position_side := "SHORT"
+    
+    // Store entry info
     entry_price := close
     tp1_hit := false
     trade_entry_bar := bar_index
     last_trade_direction := "short"
-    strategy.entry("Short", strategy.short)
+    
+    // Calculate TP/SL levels immediately
+    float temp_short_tp1 = entry_price * (1 - tp1_pct / 100)
+    float temp_short_tp2 = entry_price * (1 - tp2_pct / 100)
+    float temp_short_sl = entry_price * (1 + sl_pct / 100)
+    
+    short_tp1 := temp_short_tp1
+    short_tp2 := temp_short_tp2
+    short_sl := temp_short_sl
+    
+    // Update cooldown tracking
+    last_short_trade_bar := bar_index
+    last_short_trade_time := time
+    
+    // Execute entry
+    strategy.entry("Short", strategy.short, comment=current_trade_id)
+    entry_short_trigger := true
+    position_opened_trigger := true
+    // Send full info alert for automation
+    alert(create_alert_message('sell', current_trade_id, sl_pct, tp1_pct), alert.freq_once_per_bar)
+    
+    // Increment trade counter
+    trade_counter += 1
     
     // Clear delayed entry
     delayed_short_bar := na
@@ -252,14 +506,7 @@ if execute_short and strategy.position_size == 0
 // DUAL TAKE PROFIT SYSTEM
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Calculate TP and SL levels
-var float long_tp1 = na
-var float long_tp2 = na
-var float long_sl = na
-var float short_tp1 = na
-var float short_tp2 = na
-var float short_sl = na
-
+// Update TP and SL levels for active positions
 if strategy.position_size > 0 and not na(entry_price)
     long_tp1 := entry_price * (1 + tp1_pct / 100)
     long_tp2 := entry_price * (1 + tp2_pct / 100)
@@ -268,6 +515,7 @@ if strategy.position_size > 0 and not na(entry_price)
     // Move SL to breakeven after TP1
     if tp1_hit and move_sl_to_be
         long_sl := entry_price
+        sl_moved_to_be_trigger := true
 
 if strategy.position_size < 0 and not na(entry_price)
     short_tp1 := entry_price * (1 - tp1_pct / 100)
@@ -277,48 +525,77 @@ if strategy.position_size < 0 and not na(entry_price)
     // Move SL to breakeven after TP1
     if tp1_hit and move_sl_to_be
         short_sl := entry_price
+        sl_moved_to_be_trigger := true
 
 // Check candle count for time-based TPs
 candles_in_trade = not na(trade_entry_bar) ? bar_index - trade_entry_bar : 0
 tp1_time_exit = tp1_candles > 0 and candles_in_trade >= tp1_candles
 tp2_time_exit = tp2_candles > 0 and candles_in_trade >= tp2_candles
 
-// TP1 Exit Logic (50% position)
+// Variables for trade IDs in exits
+var string tp1_trade_id = ""
+var string tp2_trade_id = ""
+var string sl_trade_id = ""
+var float pnl = 0.0
+
+// TP1 Exit Logic (Long)
 if strategy.position_size > 0 and use_tp1 and not tp1_hit
     if high >= long_tp1 or tp1_time_exit
-        strategy.close("Long", qty_percent=50, comment="TP1")
         tp1_hit := true
+        tp1_trade_id := generate_trade_id("TPS1")
+        pnl := ((long_tp1 - entry_price) / entry_price) * 100
+        strategy.close("Long", qty_percent=50, comment=tp1_trade_id)
+        tp1_exit_trigger := true
+        alert(create_close_alert_message(tp1_trade_id), alert.freq_once_per_bar)
 
 if strategy.position_size < 0 and use_tp1 and not tp1_hit
     if low <= short_tp1 or tp1_time_exit
-        strategy.close("Short", qty_percent=50, comment="TP1")
         tp1_hit := true
+        tp1_trade_id := generate_trade_id("TPS1")
+        pnl := ((entry_price - short_tp1) / entry_price) * 100
+        strategy.close("Short", qty_percent=50, comment=tp1_trade_id)
+        tp1_exit_trigger := true
+        alert(create_close_alert_message(tp1_trade_id), alert.freq_once_per_bar)
 
-// TP2 Exit Logic (remaining 50%)
+// TP2 Exit Logic (Long)
 if strategy.position_size > 0 and use_tp2
     if high >= long_tp2 or tp2_time_exit
-        strategy.close("Long", comment="TP2")
-        probes_active := use_probes
-        last_probe_time := time
+        tp2_trade_id := generate_trade_id("TPS2")
+        pnl := ((long_tp2 - entry_price) / entry_price) * 100
+        strategy.close("Long", comment=tp2_trade_id)
+        tp2_exit_trigger := true
+        alert(create_close_alert_message(tp2_trade_id), alert.freq_once_per_bar)
 
 if strategy.position_size < 0 and use_tp2
     if low <= short_tp2 or tp2_time_exit
-        strategy.close("Short", comment="TP2")
-        probes_active := use_probes
-        last_probe_time := time
+        tp2_trade_id := generate_trade_id("TPS2")
+        pnl := ((entry_price - short_tp2) / entry_price) * 100
+        strategy.close("Short", comment=tp2_trade_id)
+        tp2_exit_trigger := true
+        alert(create_close_alert_message(tp2_trade_id), alert.freq_once_per_bar)
 
-// Stop Loss
+// Stop Loss (Long)
 if strategy.position_size > 0
     if low <= long_sl
-        strategy.close("Long", comment="SL")
-        probes_active := use_probes
-        last_probe_time := time
+        sl_trade_id := generate_trade_id("SL")
+        pnl := ((long_sl - entry_price) / entry_price) * 100
+        strategy.close("Long", comment=sl_trade_id)
+        sl_exit_trigger := true
+        alert(create_close_alert_message(sl_trade_id), alert.freq_once_per_bar)
 
 if strategy.position_size < 0
     if high >= short_sl
-        strategy.close("Short", comment="SL")
-        probes_active := use_probes
-        last_probe_time := time
+        sl_trade_id := generate_trade_id("SL")
+        pnl := ((entry_price - short_sl) / entry_price) * 100
+        strategy.close("Short", comment=sl_trade_id)
+        sl_exit_trigger := true
+        alert(create_close_alert_message(sl_trade_id), alert.freq_once_per_bar)
+
+// Move SL to BE after TP1
+if tp1_hit and move_sl_to_be
+    if strategy.position_size > 0 or strategy.position_size < 0
+        sl_moved_to_be_trigger := true
+        alert(create_move_sl_be_message(current_trade_id, strategy.position_size > 0), alert.freq_once_per_bar)
 
 // Reset tracking when position closes
 if strategy.position_size == 0 and strategy.position_size[1] != 0
@@ -331,6 +608,9 @@ if strategy.position_size == 0 and strategy.position_size[1] != 0
     short_tp1 := na
     short_tp2 := na
     short_sl := na
+    
+    // mark position closed for built-in alerts
+    position_closed_trigger := true
 
 // ═══════════════════════════════════════════════════════════════════════════
 // REDUNDANCY PROBES SYSTEM
@@ -343,14 +623,22 @@ if probes_active and not na(last_probe_time)
     time_since_last_probe = (time - last_probe_time) / 1000 // Convert to seconds
     
     if time_since_last_probe >= time_between_probes
-        // Create alert for closed position
-        alert_msg = "REDUNDANCY PROBE #" + str.tostring(probe_count + 1) + 
-             " | Direction: " + last_trade_direction + 
-             " | Status: CLOSED" +
-             " | Time: " + str.tostring(time)
+        // Create redundancy probe alert
+        probe_trade_id = current_trade_id + "-PROBE" + str.tostring(probe_count + 1)
         
-        // In live trading, this would trigger an alert
-        // For backtesting, we log it
+        alert_msg = '{'
+        alert_msg := alert_msg + '"trade_id": "' + probe_trade_id + '", '
+        alert_msg := alert_msg + '"action": "REDUNDANCY_PROBE", '
+        alert_msg := alert_msg + '"probe_number": ' + str.tostring(probe_count + 1) + ', '
+        alert_msg := alert_msg + '"original_trade": "' + current_trade_id + '", '
+        alert_msg := alert_msg + '"direction": "' + last_trade_direction + '", '
+        alert_msg := alert_msg + '"status": "CLOSED", '
+        alert_msg := alert_msg + '"timestamp": ' + str.tostring(time)
+        alert_msg := alert_msg + '}'
+        
+        if use_custom_alerts
+            alert(alert_msg, alert.freq_once_per_bar)
+        
         probe_count += 1
         last_probe_time := time
         
@@ -390,30 +678,66 @@ bgcolor(mode == "Wide Tide" and wide_tide_short ? color.new(color.red, 95) : na)
 
 // Plot BROC angle for debugging
 plot(use_broc ? broc_angle : na, "BROC Angle", color=color.new(color.purple, 0), display=display.data_window)
+plot(use_uproc ? uproc_angle : na, "UPROC Angle", color=color.new(color.blue, 0), display=display.data_window)
+plot(use_loroc ? loroc_angle : na, "LOROC Angle", color=color.new(color.orange, 0), display=display.data_window)
+
+// Visual indicator for Marubozu candles
+plotshape(use_marubozu and is_bullish_marubozu, "Bullish Marubozu", 
+     shape.triangleup, location.belowbar, color=color.new(color.green, 0), size=size.tiny)
+plotshape(use_marubozu and is_bearish_marubozu, "Bearish Marubozu", 
+     shape.triangledown, location.abovebar, color=color.new(color.red, 0), size=size.tiny)
+
+// Cooldown indicator (shows when cooldown is active)
+bgcolor(use_cooldown and not cooldown_long_ok and not cooldown_short_ok ? 
+     color.new(color.gray, 90) : na, title="Cooldown Active")
+
+// Display current trade info in a table
+var table info_table = table.new(position.top_right, 2, 6, border_width=1)
+
+if barstate.islast and use_custom_alerts
+    table.cell(info_table, 0, 0, "Trade Counter", text_color=color.white, bgcolor=color.blue)
+    table.cell(info_table, 1, 0, str.tostring(trade_counter), text_color=color.white, bgcolor=color.blue)
+    
+    table.cell(info_table, 0, 1, "Current Trade ID", text_color=color.white, bgcolor=color.navy)
+    table.cell(info_table, 1, 1, current_trade_id, text_color=color.white, bgcolor=color.navy)
+    
+    table.cell(info_table, 0, 2, "Position", text_color=color.white, bgcolor=color.navy)
+    table.cell(info_table, 1, 2, current_position_side, text_color=color.white, bgcolor=color.navy)
+    
+    table.cell(info_table, 0, 3, "Mode Prefix", text_color=color.white, bgcolor=color.gray)
+    table.cell(info_table, 1, 3, signal_prefix_mode, text_color=color.white, bgcolor=color.gray)
+    
+    table.cell(info_table, 0, 4, "TP1 Hit", text_color=color.white, bgcolor=color.gray)
+    table.cell(info_table, 1, 4, tp1_hit ? "YES" : "NO", 
+         text_color=color.white, bgcolor=tp1_hit ? color.green : color.red)
+    
+    table.cell(info_table, 0, 5, "Probes Active", text_color=color.white, bgcolor=color.gray)
+    table.cell(info_table, 1, 5, probes_active ? "YES" : "NO", 
+         text_color=color.white, bgcolor=probes_active ? color.orange : color.gray)
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ALERT CONDITIONS
+// ALERT CONDITIONS (built-in alerts)
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Entry alerts
-alertcondition(execute_long, "Long Entry", "BBB3 Long Entry Signal")
-alertcondition(execute_short, "Short Entry", "BBB3 Short Entry Signal")
+// Note: Custom alerts are sent via alert() function in the execution logic above
+// These alertcondition() calls are for TradingView's built-in alert system
+// Add separate alertconditions for entries, exits, opens/closes, and SL-breakeven moves
 
-// TP alerts
-alertcondition(strategy.position_size > 0 and high >= long_tp1 and not tp1_hit, 
-     "Long TP1", "BBB3 Long TP1 Hit")
-alertcondition(strategy.position_size > 0 and high >= long_tp2, 
-     "Long TP2", "BBB3 Long TP2 Hit")
-alertcondition(strategy.position_size < 0 and low <= short_tp1 and not tp1_hit, 
-     "Short TP1", "BBB3 Short TP1 Hit")
-alertcondition(strategy.position_size < 0 and low <= short_tp2, 
-     "Short TP2", "BBB3 Short TP2 Hit")
+alertcondition(entry_long_trigger, title="BBB3 Long Entry", message="")
+alertcondition(entry_short_trigger, title="BBB3 Short Entry", message="")
 
-// SL alerts
-alertcondition(strategy.position_size > 0 and low <= long_sl, 
-     "Long SL", "BBB3 Long Stop Loss Hit")
-alertcondition(strategy.position_size < 0 and high >= short_sl, 
-     "Short SL", "BBB3 Short Stop Loss Hit")
+alertcondition(tp1_exit_trigger, title="BBB3 TP1 Exit", message="")
+alertcondition(tp2_exit_trigger, title="BBB3 TP2 Exit", message="")
+alertcondition(sl_exit_trigger, title="BBB3 Stop Loss Exit", message="")
+
+alertcondition(position_opened_trigger, title="BBB3 Position Opened", message="")
+alertcondition(position_closed_trigger, title="BBB3 Position Closed", message="")
+
+alertcondition(sl_moved_to_be_trigger, title="BBB3 SL Moved to BE", message="")
+
+// Backwards-compatible simple alert names (kept for older usage)
+alertcondition(execute_long, "Long Entry Signal", "BBB3 Long Entry")
+alertcondition(execute_short, "Short Entry Signal", "BBB3 Short Entry")
 
 // ═══════════════════════════════════════════════════════════════════════════
 // END OF STRATEGY
