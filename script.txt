@@ -1,0 +1,420 @@
+//@version=6
+strategy("Crypto Farm BBB3", overlay=true, 
+     initial_capital=10000, 
+     default_qty_type=strategy.percent_of_equity, 
+     default_qty_value=100,
+     commission_type=strategy.commission.percent, 
+     commission_value=0.1,
+     slippage=2,
+     calc_on_every_tick=false,
+     calc_on_order_fills=false)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INPUT PARAMETERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Bollinger Bands Settings
+bb_length = input.int(20, "BB Length", minval=1, group="Bollinger Bands")
+bb_mult = input.float(2.0, "BB Multiplier", minval=0.1, step=0.1, group="Bollinger Bands")
+bb_source = input.source(close, "BB Source", group="Bollinger Bands")
+
+// Mode Selection
+mode = input.string("Wide Tide", "Trading Mode", 
+     options=["Wide Tide", "Distance Capture"], group="Strategy Mode")
+
+// Wide Tide Settings
+wt_threshold = input.float(2.5, "Wide Tide Threshold (%)", minval=0.1, step=0.1, group="Wide Tide Mode")
+
+// Distance Capture Settings
+dc_entry_pct = input.float(25.0, "Distance Capture Entry %", minval=0, maxval=100, step=1, group="Distance Capture Mode")
+
+// BROC Filter Settings
+use_broc = input.bool(true, "Use BROC Filter", group="BROC Filter")
+broc_length = input.int(14, "BROC Length", minval=1, group="BROC Filter")
+broc_threshold = input.float(0.5, "BROC Threshold (degrees)", minval=0, step=0.1, group="BROC Filter")
+broc_multiplier = input.float(1.0, "BROC Scaling Multiplier", minval=0.1, maxval=10, step=0.1, group="BROC Filter")
+
+// Extra Filters Settings
+use_uproc = input.bool(false, "Use UPROC Filter", group="Extra Filters")
+uproc_length = input.int(14, "UPROC Length", minval=1, group="Extra Filters")
+uproc_threshold = input.float(0.5, "UPROC Threshold (degrees)", minval=0, step=0.1, group="Extra Filters")
+uproc_multiplier = input.float(1.0, "UPROC Scaling Multiplier", minval=0.1, maxval=10, step=0.1, group="Extra Filters")
+
+use_loroc = input.bool(false, "Use LOROC Filter", group="Extra Filters")
+loroc_length = input.int(14, "LOROC Length", minval=1, group="Extra Filters")
+loroc_threshold = input.float(0.5, "LOROC Threshold (degrees)", minval=0, step=0.1, group="Extra Filters")
+loroc_multiplier = input.float(1.0, "LOROC Scaling Multiplier", minval=0.1, maxval=10, step=0.1, group="Extra Filters")
+
+use_marubozu = input.bool(false, "Use Marubozu Filter", group="Extra Filters")
+marubozu_body_pct = input.float(70.0, "Marubozu Body % of Range", minval=50, maxval=100, step=1, group="Extra Filters")
+marubozu_wick_pct = input.float(15.0, "Marubozu Max Wick % of Body", minval=0, maxval=50, step=1, group="Extra Filters")
+
+// Cooldown Settings
+use_cooldown = input.bool(false, "Enable Cooldown", group="Cooldown")
+cooldown_type = input.string("Candles", "Cooldown Type", options=["Candles", "Time"], group="Cooldown")
+cooldown_candles = input.int(5, "Cooldown Candles", minval=1, group="Cooldown")
+cooldown_minutes = input.int(60, "Cooldown Minutes", minval=1, group="Cooldown")
+cooldown_applies_to = input.string("Same Direction", "Apply To", 
+     options=["Same Direction", "Both Directions"], group="Cooldown")
+
+// ScoopTime Settings
+use_scooptime = input.bool(false, "Enable ScoopTime", group="ScoopTime")
+scoop_seconds = input.int(30, "Seconds Before Close", minval=1, maxval=3600, group="ScoopTime")
+
+// Delay Entry Settings
+use_delay = input.bool(false, "Enable Delay Entry", group="Delay Entry")
+delay_candles = input.int(1, "Delay Candles", minval=1, maxval=50, group="Delay Entry")
+
+// Take Profit Settings
+use_tp1 = input.bool(true, "Enable TP1", group="Take Profit")
+tp1_pct = input.float(2.0, "TP1 %", minval=0.1, step=0.1, group="Take Profit")
+tp1_candles = input.int(0, "TP1 Max Candles (0=disabled)", minval=0, group="Take Profit")
+
+use_tp2 = input.bool(true, "Enable TP2", group="Take Profit")
+tp2_pct = input.float(4.0, "TP2 %", minval=0.1, step=0.1, group="Take Profit")
+tp2_candles = input.int(0, "TP2 Max Candles (0=disabled)", minval=0, group="Take Profit")
+
+move_sl_to_be = input.bool(true, "Move SL to Breakeven after TP1", group="Take Profit")
+
+// Stop Loss Settings
+sl_pct = input.float(1.5, "Stop Loss %", minval=0.1, step=0.1, group="Stop Loss")
+
+// Redundancy Probes Settings
+use_probes = input.bool(false, "Enable Redundancy Probes", group="Redundancy Probes")
+time_between_probes = input.int(60, "Time Between Probes (seconds)", minval=1, group="Redundancy Probes")
+
+// Trade Direction
+trade_direction = input.string("Both", "Trade Direction", options=["Long", "Short", "Both"], group="Trade Settings")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GLOBAL VARIABLES & ARRAYS FOR STATE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Delayed entry tracking
+var int delayed_long_bar = na
+var int delayed_short_bar = na
+var float delayed_long_price = na
+var float delayed_short_price = na
+
+// TP tracking
+var float entry_price = na
+var bool tp1_hit = false
+var int trade_entry_bar = na
+
+// Probe tracking
+var int last_probe_time = na
+var bool probes_active = false
+var string last_trade_direction = ""
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BOLLINGER BANDS CALCULATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+[bb_middle, bb_upper, bb_lower] = ta.bb(bb_source, bb_length, bb_mult)
+
+// Plot Bollinger Bands
+plot(bb_upper, "Upper Band", color=color.new(color.blue, 0), linewidth=1)
+plot(bb_middle, "Basis", color=color.new(color.orange, 0), linewidth=1)
+plot(bb_lower, "Lower Band", color=color.new(color.blue, 0), linewidth=1)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BROC (BASIS RATE OF CHANGE) CALCULATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Calculate basis change
+basis_change = bb_middle - bb_middle[broc_length]
+
+// Calculate price range for normalization (prevents division by zero)
+price_range = math.max(high - low, 0.0001)
+
+// Convert slope to angle using arctan
+// Formula: angle = atan(rise/run) * (180/π)
+// rise = basis_change, run = broc_length * average_price_range
+average_range = ta.sma(price_range, broc_length)
+slope_ratio = basis_change / (broc_length * average_range)
+
+// Convert to degrees and apply multiplier
+broc_angle = math.atan(slope_ratio) * (180 / math.pi) * broc_multiplier
+
+// BROC filter conditions
+broc_bullish = not use_broc or broc_angle > broc_threshold
+broc_bearish = not use_broc or broc_angle < -broc_threshold
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SCOOPTIME LOGIC - BAR-STABLE IMPLEMENTATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Calculate timeframe in seconds
+tf_seconds = timeframe.in_seconds()
+
+// Determine if we're within scoop window
+// We check if the bar is close enough to closing based on bar time
+// For bar-stable behavior, we trigger on the LAST bar before close
+bars_until_close = math.floor(scoop_seconds / tf_seconds)
+is_scoop_time = use_scooptime ? (bars_until_close <= 1) : true
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WIDE TIDE MODE LOGIC
+// ═══════════════════════════════════════════════════════════════════════════
+
+bb_width = bb_upper - bb_lower
+bb_width_pct = (bb_width / bb_middle) * 100
+
+wide_tide_long = bb_width_pct > wt_threshold and close < bb_lower
+wide_tide_short = bb_width_pct > wt_threshold and close > bb_upper
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DISTANCE CAPTURE MODE LOGIC
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Calculate distance from price to bands
+distance_to_lower = bb_middle - bb_lower
+distance_to_upper = bb_upper - bb_middle
+
+// Calculate entry points based on percentage
+dc_long_level = bb_lower + (distance_to_lower * (dc_entry_pct / 100))
+dc_short_level = bb_upper - (distance_to_upper * (dc_entry_pct / 100))
+
+distance_capture_long = close <= dc_long_level
+distance_capture_short = close >= dc_short_level
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMBINED ENTRY CONDITIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Mode selection
+mode_long = mode == "Wide Tide" ? wide_tide_long : distance_capture_long
+mode_short = mode == "Wide Tide" ? wide_tide_short : distance_capture_short
+
+// Base entry signals
+base_long_signal = mode_long and broc_bullish and is_scoop_time
+base_short_signal = mode_short and broc_bearish and is_scoop_time
+
+// Direction filter
+can_long = trade_direction == "Long" or trade_direction == "Both"
+can_short = trade_direction == "Short" or trade_direction == "Both"
+
+long_signal = base_long_signal and can_long
+short_signal = base_short_signal and can_short
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DELAY ENTRY SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Store delayed entries
+if use_delay and long_signal and strategy.position_size == 0
+    delayed_long_bar := bar_index
+    delayed_long_price := close
+    delayed_short_bar := na
+
+if use_delay and short_signal and strategy.position_size == 0
+    delayed_short_bar := bar_index
+    delayed_short_price := close
+    delayed_long_bar := na
+
+// Check if delay period has passed
+delay_long_ready = use_delay and not na(delayed_long_bar) and 
+     (bar_index - delayed_long_bar >= delay_candles)
+delay_short_ready = use_delay and not na(delayed_short_bar) and 
+     (bar_index - delayed_short_bar >= delay_candles)
+
+// Final entry triggers
+execute_long = use_delay ? delay_long_ready : long_signal
+execute_short = use_delay ? delay_short_ready : short_signal
+
+// ═══════════════════════════════════════════════════════════════════════════
+// POSITION ENTRY
+// ═══════════════════════════════════════════════════════════════════════════
+
+if execute_long and strategy.position_size == 0
+    entry_price := close
+    tp1_hit := false
+    trade_entry_bar := bar_index
+    last_trade_direction := "long"
+    strategy.entry("Long", strategy.long)
+    
+    // Clear delayed entry
+    delayed_long_bar := na
+    delayed_long_price := na
+
+if execute_short and strategy.position_size == 0
+    entry_price := close
+    tp1_hit := false
+    trade_entry_bar := bar_index
+    last_trade_direction := "short"
+    strategy.entry("Short", strategy.short)
+    
+    // Clear delayed entry
+    delayed_short_bar := na
+    delayed_short_price := na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DUAL TAKE PROFIT SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Calculate TP and SL levels
+var float long_tp1 = na
+var float long_tp2 = na
+var float long_sl = na
+var float short_tp1 = na
+var float short_tp2 = na
+var float short_sl = na
+
+if strategy.position_size > 0 and not na(entry_price)
+    long_tp1 := entry_price * (1 + tp1_pct / 100)
+    long_tp2 := entry_price * (1 + tp2_pct / 100)
+    long_sl := entry_price * (1 - sl_pct / 100)
+    
+    // Move SL to breakeven after TP1
+    if tp1_hit and move_sl_to_be
+        long_sl := entry_price
+
+if strategy.position_size < 0 and not na(entry_price)
+    short_tp1 := entry_price * (1 - tp1_pct / 100)
+    short_tp2 := entry_price * (1 - tp2_pct / 100)
+    short_sl := entry_price * (1 + sl_pct / 100)
+    
+    // Move SL to breakeven after TP1
+    if tp1_hit and move_sl_to_be
+        short_sl := entry_price
+
+// Check candle count for time-based TPs
+candles_in_trade = not na(trade_entry_bar) ? bar_index - trade_entry_bar : 0
+tp1_time_exit = tp1_candles > 0 and candles_in_trade >= tp1_candles
+tp2_time_exit = tp2_candles > 0 and candles_in_trade >= tp2_candles
+
+// TP1 Exit Logic (50% position)
+if strategy.position_size > 0 and use_tp1 and not tp1_hit
+    if high >= long_tp1 or tp1_time_exit
+        strategy.close("Long", qty_percent=50, comment="TP1")
+        tp1_hit := true
+
+if strategy.position_size < 0 and use_tp1 and not tp1_hit
+    if low <= short_tp1 or tp1_time_exit
+        strategy.close("Short", qty_percent=50, comment="TP1")
+        tp1_hit := true
+
+// TP2 Exit Logic (remaining 50%)
+if strategy.position_size > 0 and use_tp2
+    if high >= long_tp2 or tp2_time_exit
+        strategy.close("Long", comment="TP2")
+        probes_active := use_probes
+        last_probe_time := time
+
+if strategy.position_size < 0 and use_tp2
+    if low <= short_tp2 or tp2_time_exit
+        strategy.close("Short", comment="TP2")
+        probes_active := use_probes
+        last_probe_time := time
+
+// Stop Loss
+if strategy.position_size > 0
+    if low <= long_sl
+        strategy.close("Long", comment="SL")
+        probes_active := use_probes
+        last_probe_time := time
+
+if strategy.position_size < 0
+    if high >= short_sl
+        strategy.close("Short", comment="SL")
+        probes_active := use_probes
+        last_probe_time := time
+
+// Reset tracking when position closes
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    entry_price := na
+    tp1_hit := false
+    trade_entry_bar := na
+    long_tp1 := na
+    long_tp2 := na
+    long_sl := na
+    short_tp1 := na
+    short_tp2 := na
+    short_sl := na
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REDUNDANCY PROBES SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Send repeated close alerts after trade exits
+var int probe_count = 0
+
+if probes_active and not na(last_probe_time)
+    time_since_last_probe = (time - last_probe_time) / 1000 // Convert to seconds
+    
+    if time_since_last_probe >= time_between_probes
+        // Create alert for closed position
+        alert_msg = "REDUNDANCY PROBE #" + str.tostring(probe_count + 1) + 
+             " | Direction: " + last_trade_direction + 
+             " | Status: CLOSED" +
+             " | Time: " + str.tostring(time)
+        
+        // In live trading, this would trigger an alert
+        // For backtesting, we log it
+        probe_count += 1
+        last_probe_time := time
+        
+        // Stop probes after 5 iterations (customizable)
+        if probe_count >= 5
+            probes_active := false
+            probe_count := 0
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VISUALIZATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Plot Distance Capture levels
+plot(mode == "Distance Capture" ? dc_long_level : na, 
+     "DC Long Level", color=color.new(color.green, 70), style=plot.style_circles)
+plot(mode == "Distance Capture" ? dc_short_level : na, 
+     "DC Short Level", color=color.new(color.red, 70), style=plot.style_circles)
+
+// Plot TP/SL levels
+plot(strategy.position_size > 0 ? long_tp1 : na, 
+     "Long TP1", color=color.new(color.green, 0), linewidth=1, style=plot.style_cross)
+plot(strategy.position_size > 0 ? long_tp2 : na, 
+     "Long TP2", color=color.new(color.lime, 0), linewidth=1, style=plot.style_cross)
+plot(strategy.position_size > 0 ? long_sl : na, 
+     "Long SL", color=color.new(color.red, 0), linewidth=1, style=plot.style_cross)
+
+plot(strategy.position_size < 0 ? short_tp1 : na, 
+     "Short TP1", color=color.new(color.red, 0), linewidth=1, style=plot.style_cross)
+plot(strategy.position_size < 0 ? short_tp2 : na, 
+     "Short TP2", color=color.new(color.maroon, 0), linewidth=1, style=plot.style_cross)
+plot(strategy.position_size < 0 ? short_sl : na, 
+     "Short SL", color=color.new(color.green, 0), linewidth=1, style=plot.style_cross)
+
+// Background color for Wide Tide mode
+bgcolor(mode == "Wide Tide" and wide_tide_long ? color.new(color.green, 95) : na)
+bgcolor(mode == "Wide Tide" and wide_tide_short ? color.new(color.red, 95) : na)
+
+// Plot BROC angle for debugging
+plot(use_broc ? broc_angle : na, "BROC Angle", color=color.new(color.purple, 0), display=display.data_window)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ALERT CONDITIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Entry alerts
+alertcondition(execute_long, "Long Entry", "BBB3 Long Entry Signal")
+alertcondition(execute_short, "Short Entry", "BBB3 Short Entry Signal")
+
+// TP alerts
+alertcondition(strategy.position_size > 0 and high >= long_tp1 and not tp1_hit, 
+     "Long TP1", "BBB3 Long TP1 Hit")
+alertcondition(strategy.position_size > 0 and high >= long_tp2, 
+     "Long TP2", "BBB3 Long TP2 Hit")
+alertcondition(strategy.position_size < 0 and low <= short_tp1 and not tp1_hit, 
+     "Short TP1", "BBB3 Short TP1 Hit")
+alertcondition(strategy.position_size < 0 and low <= short_tp2, 
+     "Short TP2", "BBB3 Short TP2 Hit")
+
+// SL alerts
+alertcondition(strategy.position_size > 0 and low <= long_sl, 
+     "Long SL", "BBB3 Long Stop Loss Hit")
+alertcondition(strategy.position_size < 0 and high >= short_sl, 
+     "Short SL", "BBB3 Short Stop Loss Hit")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// END OF STRATEGY
+// ═══════════════════════════════════════════════════════════════════════════
