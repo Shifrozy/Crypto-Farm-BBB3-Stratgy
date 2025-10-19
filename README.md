@@ -55,7 +55,7 @@
 
 ### Method 2: Clone Repository
 ```bash
-git clone https://github.com/yourusername/crypto-farm-bbb3.git
+git clone https://github.com/Shifrozy/crypto-farm-bbb3.git
 cd crypto-farm-bbb3
 ```
 
