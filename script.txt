@@ -10,14 +10,6 @@ strategy("Crypto Farm BBB3", overlay=true,
      process_orders_on_close=true,
      calc_on_order_fills=false)
 
-// DEBUG: Force a trade if no trades have occurred (for Strategy Tester)
-var bool debug_trade_opened = false
-if not debug_trade_opened and bar_index > 10 and strategy.position_size == 0
-    strategy.entry("DebugLong", strategy.long)
-    debug_trade_opened := true
-if debug_trade_opened and strategy.position_size > 0 and bar_index > 20
-    strategy.close("DebugLong")
-
 // ═══════════════════════════════════════════════════════════════════════════
 // INPUT PARAMETERS
 // ═══════════════════════════════════════════════════════════════════════════
